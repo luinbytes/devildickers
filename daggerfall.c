@@ -1,14 +1,14 @@
 /*
- * dd-bhop — bhop + air control for Devil Daggers
+ * daggerfall — bhop + air control for Devil Daggers
  *
  * Usage:
- *   dd-bhop              — bhop only (hold space)
- *   dd-bhop --strafe     — bhop + air control boost
- *   dd-bhop --diag       — live diagnostic
- *   dd-bhop --aim        — dagger landing prediction (read-only)
- *   dd-bhop --teleport X Z
+ *   daggerfall              — bhop only (hold space)
+ *   daggerfall --strafe     — bhop + air control boost
+ *   daggerfall --diag       — live diagnostic
+ *   daggerfall --aim        — dagger landing prediction (read-only)
+ *   daggerfall --teleport X Z
  *
- * Requires dd-bhop.conf (see example.conf)
+ * Requires daggerfall.conf (see example.conf)
  */
 
 #define _GNU_SOURCE
@@ -408,14 +408,14 @@ static int find_closest_enemy_fov(unsigned long arena,
 			float dot = nx*fwd_x + ny*fwd_y + nz*fwd_z; \
 			if (dot > 1.0f) dot = 1.0f; \
 			else if (dot < -1.0f) dot = -1.0f; \
-			/* sticky: only consider enemies in front of the PLAYER (not \
-			 * the cone axis — the cone may be intentionally off due to \
-			 * lead). This lets the user break stickiness by turning \
-			 * ~90°+ off the current target, but a wonky cone axis won't \
-			 * accidentally disqualify a target that's still on screen. */ \
+			/* sticky: keep target as long as it's within ~120° of player \
+			 * forward. > 0 would drop overhead enemies (skull floated up, \
+			 * pdot ≈ 0 → sticky lost → cone snaps to floor enemy). -0.5 \
+			 * gives headroom for directly-overhead (90°, pdot=0) without \
+			 * letting truly-behind targets (>120°) sneak through. */ \
 			if (have_sticky) { \
 				float pdot = nx*player_fwd_x + ny*player_fwd_y + nz*player_fwd_z; \
-				if (pdot > 0.0f) { \
+				if (pdot > -0.5f) { \
 					float sdx = (ex) - sx, sdy = (ey) - sy, sdz = (ez) - sz; \
 					float sd2 = sdx*sdx + sdy*sdy + sdz*sdz; \
 					/* Same-tier height filter: don't let sticky grab a \
@@ -1062,7 +1062,7 @@ static void run_aim(const struct cfg *c, unsigned long base, int strafe) {
 			bhop_arg.base = base;
 			bhop_arg.strafe = 1;
 			logfile = fopen(LOG_PATH, "w");
-			if (logfile) fprintf(logfile, "dd-bhop strafe log (composed with --aim)\n");
+			if (logfile) fprintf(logfile, "daggerfall strafe log (composed with --aim)\n");
 			printf("strafe timer armed — hold space to boost\n");
 			g_timeout_add(2, bhop_gtk_cb, NULL);
 		}
@@ -1160,7 +1160,7 @@ static void run_bhop(const struct cfg *c, unsigned long base, int strafe) {
 
 	if (strafe) {
 		logfile = fopen(LOG_PATH, "w");
-		if (logfile) fprintf(logfile, "dd-bhop strafe log\n");
+		if (logfile) fprintf(logfile, "daggerfall strafe log\n");
 	}
 
 	printf("bhop%s — hold space — Ctrl-C to stop\n\n", strafe ? " +strafe" : " (timing)");
@@ -1183,7 +1183,7 @@ static void run_teleport(const struct cfg *c, unsigned long base, float tx, floa
 }
 
 static void usage(const char *p){
-	fprintf(stderr,"dd-bhop — Devil Daggers bhop + air control\n"
+	fprintf(stderr,"daggerfall — Devil Daggers bhop + air control\n"
 	    "  %s              bhop only (hold space)\n"
 	    "  %s --strafe     bhop + air control boost\n"
 	    "  %s --diag       diagnostic\n"
@@ -1211,11 +1211,11 @@ int main(int argc, char **argv){
 	if (len > 0) {
 		exe_path[len] = 0;
 		char *slash = strrchr(exe_path, '/');
-		if (slash) { strcpy(slash+1, "dd-bhop.conf"); if(load_config(exe_path,&c,mode)==0) loaded=1; }
+		if (slash) { strcpy(slash+1, "daggerfall.conf"); if(load_config(exe_path,&c,mode)==0) loaded=1; }
 	}
-	if (!loaded) { char *cwd = get_current_dir_name(); if(cwd){char p[512];snprintf(p,512,"%s/dd-bhop.conf",cwd);if(load_config(p,&c,mode)==0)loaded=1;free(cwd);} }
-	if (!loaded) { char p[256]; snprintf(p,256,"%s/.config/dd-bhop.conf",getenv("HOME")?:"/tmp"); if(load_config(p,&c,mode)==0)loaded=1; }
-	if (!loaded) { fprintf(stderr,"dd-bhop.conf not found. See example.conf.\n"); return 1; }
+	if (!loaded) { char *cwd = get_current_dir_name(); if(cwd){char p[512];snprintf(p,512,"%s/daggerfall.conf",cwd);if(load_config(p,&c,mode)==0)loaded=1;free(cwd);} }
+	if (!loaded) { char p[256]; snprintf(p,256,"%s/.config/daggerfall.conf",getenv("HOME")?:"/tmp"); if(load_config(p,&c,mode)==0)loaded=1; }
+	if (!loaded) { fprintf(stderr,"daggerfall.conf not found. See example.conf.\n"); return 1; }
 
 	FILE*pg=popen("pgrep -x devildaggers","r");
 	if(!pg||fscanf(pg,"%d",&pid)!=1){fprintf(stderr,"not running\n");return 1;}pclose(pg);

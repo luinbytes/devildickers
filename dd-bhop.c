@@ -61,6 +61,10 @@ struct cfg {
 	float dagger_speed, dagger_gravity, dagger_up;
 	float fov;
 	float vel_scale;  /* player-velocity inheritance scalar (0=none, 1=full) */
+	float squid_gem_y_add;  /* extra Y added to squid gem aim point (tune for visual body) */
+	float aim_smooth;       /* hold-smoothing factor 0..1 (0.3 = ease to target) */
+	float aim_flick;        /* per-click flick smoothing (1.0 = snap instantly) */
+	int   aim_flick_frames; /* how many frames the flick smoothing stays active */
 };
 
 static pid_t        pid = 0;
@@ -101,6 +105,10 @@ enum {
 	K_DAGGER_SPEED, K_DAGGER_GRAVITY, K_DAGGER_UP,
 	K_FOV,
 	K_VEL_SCALE,   /* optional — tuning scalar for player-velocity inheritance */
+	K_SQUID_GEM_Y_ADD,   /* optional — extra Y on squid gem aim point */
+	K_AIM_SMOOTH,        /* optional — hold-smoothing factor 0..1 */
+	K_AIM_FLICK,         /* optional — per-click flick factor 0..1 */
+	K_AIM_FLICK_FRAMES,  /* optional — frames the flick lasts */
 	K_COUNT
 };
 static const char *const REQ_NAMES[K_COUNT] = {
@@ -117,6 +125,10 @@ static const char *const REQ_NAMES[K_COUNT] = {
 	"dagger_speed","dagger_gravity","dagger_up",
 	"fov",
 	"vel_scale",
+	"squid_gem_y_add",
+	"aim_smooth",
+	"aim_flick",
+	"aim_flick_frames",
 };
 
 static int load_config(const char *path, struct cfg *c, int mode) {
@@ -173,6 +185,17 @@ static int load_config(const char *path, struct cfg *c, int mode) {
 		C(K_DAGGER_UP,       dagger_up,       parse_float, float)
 		C(K_FOV,             fov,             parse_float, float)
 		C(K_VEL_SCALE,       vel_scale,       parse_float, float)
+		C(K_SQUID_GEM_Y_ADD, squid_gem_y_add, parse_float, float)
+		C(K_AIM_SMOOTH,      aim_smooth,      parse_float, float)
+		C(K_AIM_FLICK,       aim_flick,       parse_float, float)
+		#define PARSE_INT(s, o) parse_ulong((s), (unsigned long*)(o))
+		if(!matched && strcmp(k,REQ_NAMES[K_AIM_FLICK_FRAMES])==0){
+			unsigned long t;
+			if(parse_ulong(v,&t)==0){c->aim_flick_frames=(int)t;seen|=(uint64_t)1<<(K_AIM_FLICK_FRAMES);}
+			else{fprintf(stderr,"config: bad value for '%s': %s\n",REQ_NAMES[K_AIM_FLICK_FRAMES],v);fclose(f);return -1;}
+			matched=1;
+		}
+		#undef PARSE_INT
 		#undef C
 		if (!matched && *k)
 			fprintf(stderr, "config: warning: unknown key '%s' (ignored)\n", k);
@@ -182,6 +205,10 @@ static int load_config(const char *path, struct cfg *c, int mode) {
 	/* Build the required-key mask for this mode. Common keys are
 	 * required by every mode; aim-physics keys only by aim (mode==3). */
 	if (!(seen & ((uint64_t)1 << K_VEL_SCALE))) c->vel_scale = 0.5f;
+	if (!(seen & ((uint64_t)1 << K_SQUID_GEM_Y_ADD))) c->squid_gem_y_add = 0.0f;
+	if (!(seen & ((uint64_t)1 << K_AIM_SMOOTH)))      c->aim_smooth = 0.30f;
+	if (!(seen & ((uint64_t)1 << K_AIM_FLICK)))       c->aim_flick  = 1.00f;
+	if (!(seen & ((uint64_t)1 << K_AIM_FLICK_FRAMES)))c->aim_flick_frames = 3;
 
 	uint64_t req_all = (K_COUNT < 64) ? (((uint64_t)1 << K_COUNT) - 1) : ~(uint64_t)0;
 	uint64_t aim_only = ((uint64_t)1 << K_H_PITCH)
@@ -190,7 +217,11 @@ static int load_config(const char *path, struct cfg *c, int mode) {
 	                  | ((uint64_t)1 << K_DAGGER_UP)
 	                  | ((uint64_t)1 << K_FOV);
 	uint64_t optional = ((uint64_t)1 << K_VEL_SCALE)
-	                  | ((uint64_t)1 << K_DAGGER_GRAVITY);
+	                  | ((uint64_t)1 << K_DAGGER_GRAVITY)
+	                  | ((uint64_t)1 << K_SQUID_GEM_Y_ADD)
+	                  | ((uint64_t)1 << K_AIM_SMOOTH)
+	                  | ((uint64_t)1 << K_AIM_FLICK)
+	                  | ((uint64_t)1 << K_AIM_FLICK_FRAMES);
 	uint64_t required = req_all & ~optional;
 	if (mode != 3) required &= ~aim_only;
 
@@ -319,9 +350,13 @@ static struct {
 	unsigned long base;
 	int ww, wh;
 	float mx, my;
+	float src_x, src_y;   /* screen-space trajectory source */
+	int have_src;         /* 1 when src_x/src_y are valid */
 	int vis, tick;
+	int armed;            /* 1 when LMB held (aim assist engaged) */
+	float tgt_x, tgt_y, tgt_z;     /* last targeted world position (diag) */
+	float last_target_pitch;       /* last computed target pitch (diag) */
 	GtkWidget *win, *da;
-	float last_dspeed;   /* speed from most recent live dagger seen */
 	Display *key_dpy;
 } aim;
 
@@ -334,8 +369,210 @@ static struct {
 	int strafe;
 } bhop_arg;
 
+/* Sticky target max lateral drift per tick (world units) — lead prediction
+ * can move the camera so far off the actual enemy that a fresh cone search
+ * loses them. As long as an enemy exists within this radius of last tick's
+ * target position AND is in front of the player, we keep tracking it. */
+#define STICKY_RADIUS 8.0f
+
+static int find_closest_enemy_fov(unsigned long arena,
+                                   float cam_x, float cam_y, float cam_z,
+                                   float fwd_x, float fwd_y, float fwd_z,
+                                   /* player-camera forward (real, not cone axis).
+                                    * Used for the sticky "is this in front of
+                                    * the player" filter so a mis-pointed cone
+                                    * axis can't lock us behind the player. */
+                                   float player_fwd_x, float player_fwd_y, float player_fwd_z,
+                                   float half_fov_deg, float max_dist,
+                                   float c_cfg_gem_y_add,
+                                   int   have_sticky,
+                                   float sx, float sy, float sz,
+                                   float *out_x, float *out_y, float *out_z) {
+	/* acquisition scoring: closest-to-camera-forward inside acquire cone */
+	float best_angle = half_fov_deg;
+	float best_dist = max_dist;
+	float bx = 0.0f, by = 0.0f, bz = 0.0f;
+	int found = 0;
+
+	/* sticky scoring: closest-to-previous-target-position (spatial) */
+	float sticky_best_d2 = STICKY_RADIUS * STICKY_RADIUS;
+	float sbx = 0.0f, sby = 0.0f, sbz = 0.0f;
+	int sticky_found = 0;
+
+	#define CONSIDER(ex, ey, ez) do { \
+		float dx = (ex) - cam_x, dy = (ey) - cam_y, dz = (ez) - cam_z; \
+		float dist = sqrtf(dx*dx + dy*dy + dz*dz); \
+		if (dist >= 0.5f && dist <= max_dist) { \
+			float inv = 1.0f / dist; \
+			float nx = dx * inv, ny = dy * inv, nz = dz * inv; \
+			float dot = nx*fwd_x + ny*fwd_y + nz*fwd_z; \
+			if (dot > 1.0f) dot = 1.0f; \
+			else if (dot < -1.0f) dot = -1.0f; \
+			/* sticky: only consider enemies in front of the PLAYER (not \
+			 * the cone axis — the cone may be intentionally off due to \
+			 * lead). This lets the user break stickiness by turning \
+			 * ~90°+ off the current target, but a wonky cone axis won't \
+			 * accidentally disqualify a target that's still on screen. */ \
+			if (have_sticky) { \
+				float pdot = nx*player_fwd_x + ny*player_fwd_y + nz*player_fwd_z; \
+				if (pdot > 0.0f) { \
+					float sdx = (ex) - sx, sdy = (ey) - sy, sdz = (ez) - sz; \
+					float sd2 = sdx*sdx + sdy*sdy + sdz*sdz; \
+					/* Same-tier height filter: don't let sticky grab a \
+					 * skull on the floor (Y≈0.5) when the last target \
+					 * was a squid (Y≈6). Real targets don't warp 5 \
+					 * units up/down in one tick. */ \
+					if (sd2 < sticky_best_d2 && fabsf(sdy) < 3.0f) { \
+						sticky_best_d2 = sd2; \
+						sbx = (ex); sby = (ey); sbz = (ez); \
+						sticky_found = 1; \
+					} \
+				} \
+			} \
+			float angle_deg = acosf(dot) * (180.0f / (float)M_PI); \
+			if (angle_deg <= half_fov_deg) { \
+				if (!found || angle_deg < best_angle || \
+				    (angle_deg == best_angle && dist < best_dist)) { \
+					best_angle = angle_deg; \
+					best_dist = dist; \
+					bx = (ex); by = (ey); bz = (ez); \
+					found = 1; \
+				} \
+			} \
+		} \
+	} while (0)
+
+	unsigned long boid_god = rp(arena + 0x318);
+	if (boid_god >= 0x10000) {
+		unsigned long b0 = rp(boid_god + 0x20);
+		unsigned long b1 = rp(boid_god + 0x28);
+		if (b0 && b1 > b0) {
+			size_t bn = (b1 - b0) / 0xf0;
+			if (bn > 512) bn = 512;
+			for (size_t i = 0; i < bn; i++) {
+				unsigned long b = b0 + i * 0xf0;
+				uint32_t tw = ru(b);
+				uint16_t btype   = (uint16_t)(tw & 0xffff);
+				int16_t  bhealth = (int16_t)(tw >> 16);
+				if (btype == 0 || btype > 5 || bhealth <= 0) continue;
+				float x = rf(b + 0x08), y = rf(b + 0x0c), z = rf(b + 0x10);
+				CONSIDER(x, y, z);
+			}
+		}
+	}
+
+	unsigned long sq_sys = rp(arena + 0x330);
+	if (sq_sys >= 0x10000) {
+		unsigned long sq0 = rp(sq_sys + 0x18);
+		unsigned long sq1 = rp(sq_sys + 0x20);
+		if (sq0 && sq1 > sq0) {
+			size_t n = (sq1 - sq0) / 0x148;
+			if (n > 512) n = 512;
+			for (size_t i = 0; i < n; i++) {
+				unsigned long sq = sq0 + i * 0x148;
+				if (ru(sq + 0x00) >= 2) continue;  /* dying/dead */
+				uint32_t variant = ru(sq + 0xf0);
+				float bpx = rf(sq + 0x0c), bpy = rf(sq + 0x10), bpz = rf(sq + 0x14);
+				float scale = rf(sq + 0x8c);
+				/* col0 of the squid's rotation matrix (+0x18/1c/20): the gems
+				 * orbit along ±col0 at radius 0.59*scale. col0.y is ~0 because
+				 * the final orientation rotates only in the XZ plane. */
+				float cx = rf(sq + 0x18), cy = rf(sq + 0x1c), cz = rf(sq + 0x20);
+				float radial = 0.59f * scale;  /* DAT_003af130 = 0.59 */
+				/* zone hp counters: +0x94 = gem0 (on +col0), +0x98 = gem1 (-col0).
+				 * zone <= 0 = that gem has been broken off, skip it. */
+				int z0_alive = (int)ru(sq + 0x94) > 0;
+				int z1_alive = (int)ru(sq + 0x98) > 0;
+				float y_add = c_cfg_gem_y_add;  /* filled below */
+				(void)y_add;  /* silence if accidentally unused */
+
+				if (variant == 2) {
+					/* Squid III (centipede-style): 3 zones, radius = 1.6*scale.
+					 * Body position is the best single target we have without
+					 * per-segment data; keep it simple. */
+					CONSIDER(bpx, bpy + c_cfg_gem_y_add, bpz);
+					continue;
+				}
+
+				/* Squid I/II (variant 0/1): two gems on opposite sides.
+				 * Visibility = gem side dot (player - body) > 0 in XZ. */
+				float to_px = cam_x - bpx;
+				float to_pz = cam_z - bpz;
+				float face0 = cx * to_px + cz * to_pz;  /* + = gem0 on near side */
+
+				if (z0_alive && face0 > 0.0f) {
+					float gx = bpx + radial * cx;
+					float gy = bpy + radial * cy + c_cfg_gem_y_add;
+					float gz = bpz + radial * cz;
+					CONSIDER(gx, gy, gz);
+				}
+				if (z1_alive && face0 < 0.0f) {
+					float gx = bpx - radial * cx;
+					float gy = bpy - radial * cy + c_cfg_gem_y_add;
+					float gz = bpz - radial * cz;
+					CONSIDER(gx, gy, gz);
+				}
+				/* fallback when neither gem is visible (back-facing angle,
+				 * or both dead) — aim at body center so we still have a
+				 * target to track for movement prediction. */
+				if (!((z0_alive && face0 > 0.0f) || (z1_alive && face0 < 0.0f))) {
+					CONSIDER(bpx, bpy + c_cfg_gem_y_add, bpz);
+				}
+			}
+		}
+	}
+
+	unsigned long sp_sys = rp(arena + 0x340);
+	if (sp_sys >= 0x10000) {
+		unsigned long sp0 = rp(sp_sys + 0x28);
+		unsigned long sp1 = rp(sp_sys + 0x30);
+		if (sp0 && sp1 > sp0) {
+			size_t n = (sp1 - sp0) / 0x160;
+			if (n > 512) n = 512;
+			for (size_t i = 0; i < n; i++) {
+				unsigned long sp = sp0 + i * 0x160;
+				if (ru(sp + 0x00) >= 3) continue;
+				float scale = rf(sp + 0xac);
+				float wx = rf(sp + 0x24) + 1.6f * scale * rf(sp + 0x48);
+				float wy = rf(sp + 0x28) + 1.6f * scale * rf(sp + 0x4c);
+				float wz = rf(sp + 0x2c) + 1.6f * scale * rf(sp + 0x50);
+				CONSIDER(wx, wy, wz);
+			}
+		}
+	}
+
+	unsigned long egg0 = rp(arena + 0x290);
+	unsigned long egg1 = rp(arena + 0x298);
+	if (egg0 && egg1 > egg0) {
+		size_t n = (egg1 - egg0) / 0xa0;
+		if (n > 512) n = 512;
+		for (size_t i = 0; i < n; i++) {
+			unsigned long e = egg0 + i * 0xa0;
+			if (ru(e + 0x84) != 0) continue;
+			float x = rf(e + 0x34), y = rf(e + 0x38), z = rf(e + 0x3c);
+			CONSIDER(x, y, z);
+		}
+	}
+
+	#undef CONSIDER
+
+	/* Sticky wins: same enemy as last tick beats the cone-closest candidate.
+	 * If the sticky match fails (enemy died, turned away, etc.), fall back
+	 * to fresh acquisition inside the cone. */
+	if (sticky_found) {
+		*out_x = sbx; *out_y = sby; *out_z = sbz;
+		return 1;
+	}
+	if (!found) return 0;
+	*out_x = bx; *out_y = by; *out_z = bz;
+	return 1;
+}
+
 /* scan arena dagger pool for the live dagger with the highest uid.
- * returns 1 and fills out params if found, 0 if pool is empty or all dead. */
+ * returns 1 and fills out params if found, 0 if pool is empty or all dead.
+ * Currently unused — the overlay is PRED-only to avoid jitter from the
+ * highest-UID dagger changing every shot — but kept for future use. */
+__attribute__((unused))
 static int read_latest_dagger(unsigned long arena,
                                float *pos_x, float *pos_y, float *pos_z,
                                float *dir_x, float *dir_y, float *dir_z,
@@ -377,13 +614,27 @@ static gboolean aim_draw_cb(GtkWidget *w, cairo_t *cr, gpointer p) {
 	cairo_set_source_rgba(cr, 0, 0, 0, 0);
 	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
 	cairo_paint(cr);
-	/* ring */
-	cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 0.85);
+	/* trajectory line from source (camera centre or live dagger) to aimpoint */
+	if (aim.have_src) {
+		cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 0.45);
+		cairo_set_line_width(cr, 1.5);
+		cairo_move_to(cr, aim.src_x, aim.src_y);
+		cairo_line_to(cr, aim.mx, aim.my);
+		cairo_stroke(cr);
+	}
+	/* ring — dimmer when idle, full pink when LMB held and engaged */
+	if (aim.armed)
+		cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 0.95);
+	else
+		cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.35);
 	cairo_set_line_width(cr, 2.0);
 	cairo_arc(cr, aim.mx, aim.my, 10, 0, 2 * M_PI);
 	cairo_stroke(cr);
 	/* center dot */
-	cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 1.0);
+	if (aim.armed)
+		cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 1.0);
+	else
+		cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.55);
 	cairo_arc(cr, aim.mx, aim.my, 3, 0, 2 * M_PI);
 	cairo_fill(cr);
 	return FALSE;
@@ -393,6 +644,7 @@ static gboolean aim_tick_cb(gpointer p) {
 	(void)p;
 	if (!running) { gtk_main_quit(); return FALSE; }
 
+	/* 1. Resolve hero */
 	unsigned long hero = 0;
 	if (resolve(aim.c, aim.base, &hero) < 0) {
 		aim.vis = 0;
@@ -400,71 +652,59 @@ static gboolean aim_tick_cb(gpointer p) {
 		return TRUE;
 	}
 
-	/* hide during death / menu — whitelist known alive states */
+	/* 2. Alive check — hide during death / menu */
 	uint32_t alive = ru(hero + aim.c->h_alive);
 	if (alive != aim.c->state_gnd &&
 	    alive != aim.c->state_air &&
 	    alive != aim.c->state_fall) {
-		aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE;
+		aim.vis = 0;
+		gtk_widget_queue_draw(aim.da);
+		return TRUE;
 	}
 
+	/* 3. Position + eye height
+	 * NOTE: previous builds also read hero+0xd0 as a "dynamic eye" value,
+	 * but that field is unidentified and can produce garbage. Use the
+	 * explicit dagger_up offset from config so the user can tune it. */
 	float px = rf(hero + aim.c->h_pos_x);
 	float py = rf(hero + aim.c->h_pos_y);
 	float pz = rf(hero + aim.c->h_pos_z);
-	float eye_raw = rf(hero + 0xd0);  /* logged; range-checked before use */
-	float eye_y = py + ((eye_raw > 0.0f && eye_raw < 5.0f) ? eye_raw : aim.c->dagger_up);
+	float eye_y = py + aim.c->dagger_up;
+
+	/* 4. Camera basis from yaw/pitch */
 	float yaw   = rf(hero + aim.c->h_yaw);
 	float pitch = rf(hero + aim.c->h_pitch);
-
 	float cp = cosf(pitch), sp = sinf(pitch);
 	float cy = cosf(yaw),   sy = sinf(yaw);
-
 	float fx = sy*cp, fy = -sp, fz = -cy*cp;
-	float rx = cy, ry = 0.0f, rz = sy;
+	float rx = cy,    ry = 0.0f, rz = sy;
 	float ux = ry*fz - rz*fy;
 	float uy = rz*fx - rx*fz;
 	float uz = rx*fy - ry*fx;
 
-	/* resolve arena for live dagger read */
-	unsigned long g     = rp(aim.base + aim.c->off_globals);
-	unsigned long arena = rp(g + aim.c->off_arena);
-
-	float lx, lz;
-	int live_mode = 0;
-
-	float dpos_x, dpos_y, dpos_z, ddir_x, ddir_y, ddir_z, dspeed;
-	if (arena >= 0x10000 &&
-	    read_latest_dagger(arena, &dpos_x, &dpos_y, &dpos_z,
-	                               &ddir_x, &ddir_y, &ddir_z, &dspeed)) {
-		/* live dagger: straight-line floor intersection from actual position */
-		float vspd = ddir_y * dspeed;
-		if (vspd >= 0.0f || dpos_y <= 0.0f) {
-			aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE;
-		}
-		float t = -dpos_y / vspd;
-		if (t > 25.0f) { aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE; }
-		lx = dpos_x + ddir_x * dspeed * t;
-		lz = dpos_z + ddir_z * dspeed * t;
-		aim.last_dspeed = dspeed;
-		live_mode = 1;
+	/* 5. Landing point — SINGLE path along current aim direction.
+	 *    Immutable below this block. Aim assist (step 8) never touches
+	 *    lx/land_y/lz; it only rotates the camera, which feeds the
+	 *    NEXT tick's fx/fy/fz. */
+	float spd = aim.c->dagger_speed;
+	float t;
+	float land_y;
+	if (fy < -0.005f && eye_y > 0.01f) {
+		t = eye_y / (spd * -fy);
+		if (t > 25.0f) t = 25.0f;
+		land_y = 0.0f;
 	} else {
-		/* fallback: predict where a shot aimed now would land */
-		if (fy > -0.005f || eye_y < 0.01f) {
-			aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE;
-		}
-		float spd = aim.last_dspeed > 0.0f ? aim.last_dspeed : aim.c->dagger_speed;
-		float t = -eye_y / (spd * fy);
-		if (t > 25.0f) { aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE; }
-		lx = px + spd * fx * t;
-		lz = pz + spd * fz * t;
+		t = 25.0f;
+		land_y = eye_y + spd * fy * t;
 	}
+	float lx = px + spd * fx * t;
+	float lz = pz + spd * fz * t;
 
-	/* world-to-screen: camera at (px, eye_y, pz), landing at (lx, 0, lz) */
-	float dx = lx - px, dy = 0.0f - eye_y, dz = lz - pz;
+	/* 6. World-to-screen of the landing point */
+	float dx = lx - px, dy = land_y - eye_y, dz = lz - pz;
 	float depth = dx*fx + dy*fy + dz*fz;
 	float scr_x = dx*rx + dy*ry + dz*rz;
 	float scr_y = dx*ux + dy*uy + dz*uz;
-
 	if (depth > 0.1f) {
 		float fov = aim.c->fov > 0.0f ? aim.c->fov : 90.0f;
 		float tan_half = tanf(fov * (float)M_PI / 360.0f);
@@ -478,11 +718,194 @@ static gboolean aim_tick_cb(gpointer p) {
 		aim.vis = 0;
 	}
 
+	/* 7. Trajectory source — always screen centre */
+	aim.src_x = (float)aim.ww * 0.5f;
+	aim.src_y = (float)aim.wh * 0.5f;
+	aim.have_src = 1;
+
+	/* 8. Aim assist — INDEPENDENT. Writes yaw/pitch only. Never modifies
+	 *    lx/land_y/lz/aim.mx/aim.my. The visual above is already frozen
+	 *    for this tick. Camera rotation takes effect next tick.
+	 *
+	 *    Movement prediction: track enemy delta-position between ticks
+	 *    (16ms cadence) to estimate velocity, then lead the aim by the
+	 *    dagger's expected flight time to the target. */
+	{
+		static float prev_ex = 0, prev_ey = 0, prev_ez = 0;
+		static int   have_prev_target = 0;
+		static int   lmb_prev = 0;
+		static int   flick_frames_left = 0;
+		/* previous-tick desired aim direction (unit vec from player through the
+		 * leaded target). When valid, we use this as the FOV-cone centre
+		 * instead of the hero's current camera-forward — this keeps the cone
+		 * where we WANT to be looking rather than where the camera is lagging
+		 * to due to smoothing + lead prediction. */
+		static float prev_aim_dx = 0, prev_aim_dy = 0, prev_aim_dz = 0;
+		static int   have_prev_aim_dir = 0;
+
+		/* LMB gate: engage only while LMB is held. On press-edge, queue a
+		 * few frames of hard-snap ("flick") so a quick tap — the shotgun
+		 * release — still lands on the target. Polling root-window mask
+		 * works regardless of which window has focus. */
+		int lmb_now = 0;
+		if (aim.key_dpy) {
+			Window rr, cr_;
+			int rx_, ry_, wx_, wy_;
+			unsigned int mask;
+			if (XQueryPointer(aim.key_dpy, DefaultRootWindow(aim.key_dpy),
+			                  &rr, &cr_, &rx_, &ry_, &wx_, &wy_, &mask)) {
+				lmb_now = (mask & Button1Mask) ? 1 : 0;
+			}
+		}
+		if (lmb_now && !lmb_prev) flick_frames_left = aim.c->aim_flick_frames;
+		lmb_prev = lmb_now;
+
+		/* Engage while LMB is held, OR for a few frames after a tap so the
+		 * shotgun release still snaps onto the target even if LMB was let
+		 * go before the next tick landed. */
+		int engage = lmb_now || flick_frames_left > 0;
+
+		/* reticle: pink when engaged, dim white otherwise */
+		aim.armed = engage ? 1 : 0;
+
+		if (!engage) {
+			have_prev_target  = 0;
+			have_prev_aim_dir = 0;
+			goto end_aim_assist;
+		}
+
+		unsigned long g     = rp(aim.base + aim.c->off_globals);
+		unsigned long arena = rp(g + aim.c->off_arena);
+		if (arena >= 0x10000) {
+			/* Cone axis: prefer last tick's desired aim direction (where
+			 * we wanted to be looking) over the actual lagging camera
+			 * forward. BUT reject the saved direction if it's wandered
+			 * more than ~45° off the real camera — that's a stale
+			 * pointer from a prior target that's likely sending the
+			 * cone where the player isn't looking. */
+			float cone_fx = fx, cone_fy = fy, cone_fz = fz;
+			if (have_prev_aim_dir) {
+				float d = fx*prev_aim_dx + fy*prev_aim_dy + fz*prev_aim_dz;
+				if (d > 0.707f) {  /* within ~45° of real forward */
+					cone_fx = prev_aim_dx;
+					cone_fy = prev_aim_dy;
+					cone_fz = prev_aim_dz;
+				} else {
+					have_prev_aim_dir = 0;  /* stale, drop it */
+				}
+			}
+			float ex, ey, ez;
+			if (find_closest_enemy_fov(arena, px, eye_y, pz,
+			                           cone_fx, cone_fy, cone_fz,
+			                           fx, fy, fz,  /* real player forward */
+			                           15.0f, 80.0f,
+			                           aim.c->squid_gem_y_add,
+			                           have_prev_target,
+			                           prev_ex, prev_ey, prev_ez,
+			                           &ex, &ey, &ez)) {
+				/* velocity from previous tick (reset if target jumped > 10 units) */
+				float vel_x = 0, vel_y = 0, vel_z = 0;
+				if (have_prev_target) {
+					float d2 = (ex-prev_ex)*(ex-prev_ex)
+					         + (ey-prev_ey)*(ey-prev_ey)
+					         + (ez-prev_ez)*(ez-prev_ez);
+					if (d2 < 100.0f) {  /* < 10 units = same target */
+						float inv_dt = 62.5f;  /* 16ms tick → 62.5 Hz */
+						vel_x = (ex - prev_ex) * inv_dt;
+						vel_y = (ey - prev_ey) * inv_dt;
+						vel_z = (ez - prev_ez) * inv_dt;
+					}
+				}
+				prev_ex = ex; prev_ey = ey; prev_ez = ez;
+				have_prev_target = 1;
+				aim.tgt_x = ex; aim.tgt_y = ey; aim.tgt_z = ez;
+
+				/* lead: dagger flight time = distance / speed */
+				float tdx0 = ex - px, tdy0 = ey - eye_y, tdz0 = ez - pz;
+				float dist = sqrtf(tdx0*tdx0 + tdy0*tdy0 + tdz0*tdz0);
+				float flight_t = dist / aim.c->dagger_speed;
+				if (flight_t > 2.0f) flight_t = 2.0f;
+
+				/* clamp velocity magnitude to reject spikes from target
+				 * switches / teleporting enemies. 15 u/s is well above
+				 * any real in-game motion. */
+				float vmag = sqrtf(vel_x*vel_x + vel_y*vel_y + vel_z*vel_z);
+				if (vmag > 15.0f) {
+					float s = 15.0f / vmag;
+					vel_x *= s; vel_y *= s; vel_z *= s;
+				}
+
+				/* Never lead downward. Enemies can't go below the floor,
+				 * so any negative vel_y is either bobbing noise, dying-
+				 * animation descent, or the game clamping against the
+				 * floor next tick — leading along it only gives us floor
+				 * shots. Horizontal (XZ) lead is unaffected. */
+				if (vel_y < 0.0f) vel_y = 0.0f;
+
+				float pred_x = ex + vel_x * flight_t;
+				float pred_y = ey + vel_y * flight_t;
+				float pred_z = ez + vel_z * flight_t;
+
+				/* Hard floor safety: never aim below Y=0.5 regardless of
+				 * what the target is doing. The floor is at Y=0 and no
+				 * hittable enemy has a hitbox below ~0.5. */
+				if (pred_y < 0.5f) pred_y = 0.5f;
+				/* Also never drop below the enemy's own Y — pairs with
+				 * the vel_y >= 0 rule above to make downward lead a
+				 * no-op, but guards against any other source of drift. */
+				if (pred_y < ey) pred_y = ey;
+
+				float tdx = pred_x - px;
+				float tdy = pred_y - eye_y;
+				float tdz = pred_z - pz;
+				float horiz = sqrtf(tdx*tdx + tdz*tdz);
+
+				/* Remember where we WANT to look — next tick we use this
+				 * as the cone axis so the FOV tracks the lead, not the
+				 * lagging camera. */
+				float adist = sqrtf(tdx*tdx + tdy*tdy + tdz*tdz);
+				if (adist > 0.001f) {
+					float ainv = 1.0f / adist;
+					prev_aim_dx = tdx * ainv;
+					prev_aim_dy = tdy * ainv;
+					prev_aim_dz = tdz * ainv;
+					have_prev_aim_dir = 1;
+				}
+
+				float target_yaw   = atan2f(tdx, -tdz);
+				float target_pitch = atan2f(-tdy, horiz);
+				aim.last_target_pitch = target_pitch;
+
+				float dyaw = target_yaw - yaw;
+				while (dyaw >  (float)M_PI) dyaw -= 2.0f * (float)M_PI;
+				while (dyaw < -(float)M_PI) dyaw += 2.0f * (float)M_PI;
+
+				float smooth = aim.c->aim_smooth;
+				if (flick_frames_left > 0) {
+					smooth = aim.c->aim_flick;
+					flick_frames_left--;
+				}
+				wf(hero + aim.c->h_yaw,   yaw   + dyaw * smooth);
+				wf(hero + aim.c->h_pitch, pitch + (target_pitch - pitch) * smooth);
+			} else {
+				have_prev_target  = 0;
+				have_prev_aim_dir = 0;
+			}
+		}
+		end_aim_assist:;
+	}
+
+	/* 9. Diagnostic */
 	if (++aim.tick % 10 == 0) {
-		float ddist = sqrtf(dx*dx + dz*dz);
-		printf("\r[%s|%s] aim=(%7.2f,%7.2f) dist=%.1f depth=%.1f eye_y=%.2f(raw:%.3f)  ",
-		       state_str(aim.c, alive), live_mode ? "LIVE" : "PRED",
-		       lx, lz, ddist, depth, eye_y, eye_raw);
+		float ddist = sqrtf((lx - px)*(lx - px) + (lz - pz)*(lz - pz));
+		printf("\r[%s] armed=%d  py=%.2f eye_y=%.2f  "
+		       "tgt=(%.1f,%.2f,%.1f)  pitch=%.2f->%.2f  "
+		       "aim=(%.1f,%.1f) dist=%.1f  ",
+		       state_str(aim.c, alive), aim.armed,
+		       py, eye_y,
+		       aim.tgt_x, aim.tgt_y, aim.tgt_z,
+		       pitch, aim.last_target_pitch,
+		       lx, lz, ddist);
 		fflush(stdout);
 	}
 
@@ -553,7 +976,6 @@ static void run_aim(const struct cfg *c, unsigned long base, int strafe) {
 	memset(&aim, 0, sizeof(aim));
 	aim.c = c;
 	aim.base = base;
-	aim.last_dspeed = c->dagger_speed;  /* seed with config value until first live read */
 
 	/* open X display (reserved for future hotkeys) */
 	aim.key_dpy = XOpenDisplay(NULL);

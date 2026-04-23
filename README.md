@@ -7,7 +7,7 @@ Hold space to auto bhop with perfect timing. Hold space + WASD to fly around the
 ## Building
 
 ```bash
-gcc -O2 -o dd-bhop dd-bhop.c -lX11 -lm
+gcc -O2 -o dd-bhop dd-bhop.c -lX11 -lm $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0)
 ```
 
 ## Setup
@@ -22,6 +22,7 @@ The tool looks for `dd-bhop.conf` in three places: next to the binary, current w
 ./dd-bhop              # auto bhop (hold space)
 ./dd-bhop --strafe     # bhop + air control (hold space + WASD)
 ./dd-bhop --diag       # live position/velocity/state readout
+./dd-bhop --aim        # dagger landing prediction overlay (read-only)
 ./dd-bhop --teleport X Z
 ```
 
@@ -33,6 +34,8 @@ The tool looks for `dd-bhop.conf` in three places: next to the binary, current w
 
 `dd-bhop --diag` shows a live readout of position, velocity, yaw, alive state, and speed params.
 
+`dd-bhop --aim` renders a click-through overlay showing where your daggers will land on the floor. Read-only — no memory writes. Uses GTK3 layer-shell so it works on Wayland compositors. Requires `h_pitch` and projectile physics params in your config.
+
 `dd-bhop --teleport X Z` moves your hero to the given X,Z coordinates.
 
 ## Requirements
@@ -40,4 +43,5 @@ The tool looks for `dd-bhop.conf` in three places: next to the binary, current w
 * Linux
 * Devil Daggers running via Steam (Linux native build)
 * X11 development headers (`libx11-dev` or equivalent)
+* GTK3 development headers + `gtk-layer-shell` (for `--aim` overlay)
 * Your own `dd-bhop.conf` with the right offsets

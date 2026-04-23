@@ -5,6 +5,7 @@
  *   dd-bhop              — bhop only (hold space)
  *   dd-bhop --strafe     — bhop + air control boost
  *   dd-bhop --diag       — live diagnostic
+ *   dd-bhop --aim        — dagger landing prediction (read-only)
  *   dd-bhop --teleport X Z
  *
  * Requires dd-bhop.conf (see example.conf)
@@ -21,7 +22,11 @@
 #include <math.h>
 #include <time.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
+#include <gtk/gtk.h>
+#include <gtk-layer-shell.h>
 
 #define POLL_US  2000
 #define LOG_PATH "/tmp/dd-strafe.log"
@@ -30,7 +35,7 @@ struct cfg {
 	unsigned long off_globals, off_arena, off_hero;
 	unsigned long h_pos_x, h_pos_y, h_pos_z;
 	unsigned long h_vel_x, h_vel_y, h_vel_z;
-	unsigned long h_yaw, h_alive;
+	unsigned long h_yaw, h_pitch, h_alive;
 	unsigned long h_spd_a, h_spd_b, h_spd_c, h_spd_d, h_spd_e;
 	unsigned long h_frict, h_timing, h_perf;
 	uint32_t state_gnd, state_air, state_fall;
@@ -39,6 +44,8 @@ struct cfg {
 	float boost_spd_c, boost_spd_d, boost_spd_e;
 	float boost_frict;
 	float gravity_cut, max_boost_alt;
+	float dagger_speed, dagger_gravity, dagger_up;
+	float fov;
 };
 
 static pid_t        pid = 0;
@@ -89,6 +96,7 @@ static int load_config(const char *path, struct cfg *c) {
 		C("h_vel_y", h_vel_y, parse_ulong, unsigned long)
 		C("h_vel_z", h_vel_z, parse_ulong, unsigned long)
 		C("h_yaw",   h_yaw,   parse_ulong, unsigned long)
+		C("h_pitch", h_pitch, parse_ulong, unsigned long)
 		C("h_alive", h_alive, parse_ulong, unsigned long)
 		C("h_spd_a", h_spd_a, parse_ulong, unsigned long)
 		C("h_spd_b", h_spd_b, parse_ulong, unsigned long)
@@ -109,6 +117,10 @@ static int load_config(const char *path, struct cfg *c) {
 		C("boost_frict", boost_frict, parse_float, float)
 		C("gravity_cut",   gravity_cut,   parse_float, float)
 		C("max_boost_alt", max_boost_alt, parse_float, float)
+		C("dagger_speed",    dagger_speed,    parse_float, float)
+		C("dagger_gravity",  dagger_gravity,  parse_float, float)
+		C("dagger_up",       dagger_up,       parse_float, float)
+		C("fov",             fov,             parse_float, float)
 		#undef C
 	}
 	fclose(f);
@@ -177,6 +189,228 @@ static void run_diag(const struct cfg *c, unsigned long base) {
 		fflush(stdout);
 		px=cx; pz=pz; prev=now; usleep(5000);
 	}
+	printf("\n");
+}
+
+/* recursively find a top-level X11 window whose WM_NAME contains needle */
+static Window find_window_by_name(Display *dpy, Window root, const char *needle) {
+	Window found = 0, dummy1, dummy2, *children;
+	unsigned int nch;
+	if (!XQueryTree(dpy, root, &dummy1, &dummy2, &children, &nch) || !children)
+		return 0;
+	for (unsigned int i = 0; i < nch && !found; i++) {
+		char *name = NULL;
+		if (XFetchName(dpy, children[i], &name) && name) {
+			if (strcasestr(name, needle))
+				found = children[i];
+			XFree(name);
+		}
+		if (!found)
+			found = find_window_by_name(dpy, children[i], needle);
+	}
+	XFree(children);
+	return found;
+}
+
+/* get absolute x/y and w/h of a window (follows frame to parent if needed) */
+static int win_geom(Display *dpy, Window w, int *x, int *y, int *ww, int *wh) {
+	if (!w) return -1;
+	XWindowAttributes wa;
+	if (!XGetWindowAttributes(dpy, w, &wa)) return -1;
+	if (wa.override_redirect || wa.class == InputOnly) {
+		/* use as-is */
+		*x = wa.x; *y = wa.y; *ww = wa.width; *wh = wa.height;
+	} else {
+		Window parent = w, root_ret, *junk;
+		unsigned int nj;
+		XQueryTree(dpy, parent, &root_ret, &parent, &junk, &nj);
+		if (junk) XFree(junk);
+		if (parent && parent != root_ret) {
+			XWindowAttributes pa;
+			if (XGetWindowAttributes(dpy, parent, &pa)) {
+				*x = pa.x; *y = pa.y; *ww = pa.width; *wh = pa.height;
+			} else {
+				*x = wa.x; *y = wa.y; *ww = wa.width; *wh = wa.height;
+			}
+		} else {
+			*x = wa.x; *y = wa.y; *ww = wa.width; *wh = wa.height;
+		}
+	}
+	/* translate to root coords */
+	Window child;
+	XTranslateCoordinates(dpy, w, DefaultRootWindow(dpy), 0, 0, x, y, &child);
+	return 0;
+}
+
+/* aim overlay context */
+static struct {
+	const struct cfg *c;
+	unsigned long base;
+	int ww, wh;
+	float mx, my;
+	int vis, tick;
+	GtkWidget *win, *da;
+} aim;
+
+static gboolean aim_draw_cb(GtkWidget *w, cairo_t *cr, gpointer p) {
+	(void)w; (void)p;
+	if (!aim.vis) return FALSE;
+	/* clear to transparent */
+	cairo_set_source_rgba(cr, 0, 0, 0, 0);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_paint(cr);
+	/* ring */
+	cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 0.85);
+	cairo_set_line_width(cr, 2.0);
+	cairo_arc(cr, aim.mx, aim.my, 10, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	/* center dot */
+	cairo_set_source_rgba(cr, 1.0, 0.62, 0.71, 1.0);
+	cairo_arc(cr, aim.mx, aim.my, 3, 0, 2 * M_PI);
+	cairo_fill(cr);
+	return FALSE;
+}
+
+static gboolean aim_tick_cb(gpointer p) {
+	(void)p;
+	if (!running) { gtk_main_quit(); return FALSE; }
+
+	unsigned long hero = 0;
+	if (resolve(aim.c, aim.base, &hero) < 0) {
+		aim.vis = 0;
+		gtk_widget_queue_draw(aim.da);
+		return TRUE;
+	}
+
+	float px = rf(hero + aim.c->h_pos_x);
+	float py = rf(hero + aim.c->h_pos_y);
+	float pz = rf(hero + aim.c->h_pos_z);
+	float yaw = rf(hero + aim.c->h_yaw);
+	float pitch = rf(hero + aim.c->h_pitch);
+
+	float cp = cosf(pitch), sp = sinf(pitch);
+	float cy = cosf(yaw),   sy = sinf(yaw);
+
+	float fx = sy*cp, fy = -sp, fz = -cy*cp;
+	float rx = cy, ry = 0.0f, rz = sy;
+	float ux = fy*rz - fz*ry;
+	float uy = fz*rx - fx*rz;
+	float uz = fx*ry - fy*rx;
+
+	float dvx = aim.c->dagger_speed * fx;
+	float dvy = aim.c->dagger_speed * fy + aim.c->dagger_up;
+	float dvz = aim.c->dagger_speed * fz;
+
+	float g = aim.c->dagger_gravity;
+	float disc = dvy*dvy + 2.0f*g*py;
+	if (disc < 0 || g <= 0.0f) { aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE; }
+	float t = (dvy + sqrtf(disc)) / g;
+	if (t < 0.0f) { aim.vis = 0; gtk_widget_queue_draw(aim.da); return TRUE; }
+
+	float lx = px + dvx*t;
+	float lz = pz + dvz*t;
+
+	float dx = lx - px, dy = -py, dz = lz - pz;
+	float depth = dx*fx + dy*fy + dz*fz;
+	float scr_x = dx*rx + dy*ry + dz*rz;
+	float scr_y = dx*ux + dy*uy + dz*uz;
+
+	if (depth > 0.1f) {
+		float fov = aim.c->fov > 0.0f ? aim.c->fov : 90.0f;
+		float tan_half = tanf(fov * (float)M_PI / 360.0f);
+		float nx = scr_x / (depth * tan_half);
+		float ny = scr_y / (depth * tan_half);
+		aim.mx = (float)aim.ww * (nx + 1.0f) * 0.5f;
+		aim.my = (float)aim.wh * (1.0f - ny) * 0.5f;
+		aim.vis = 1;
+	} else {
+		aim.vis = 0;
+	}
+
+	if (++aim.tick % 10 == 0) {
+		float ddist = sqrtf(dx*dx + dz*dz);
+		uint32_t alive; vm_rd(hero + aim.c->h_alive, &alive, 4);
+		printf("\r[%s] aim=(%7.2f, %7.2f) dist=%.1f t=%.3fs depth=%.1f   ",
+		       state_str(aim.c, alive), lx, lz, ddist, t, depth);
+		fflush(stdout);
+	}
+
+	gtk_widget_queue_draw(aim.da);
+	return TRUE;
+}
+
+static void run_aim(const struct cfg *c, unsigned long base) {
+	memset(&aim, 0, sizeof(aim));
+	aim.c = c;
+	aim.base = base;
+
+	/* find game window geometry from hyprctl */
+	int gx = 0, gy = 0;
+	FILE *hc = popen(
+	    "hyprctl clients -j 2>/dev/null | "
+	    "jq -r '.[] | select(.initialClass == \"Devil Daggers\") | "
+	    "\"\\(.at[0]) \\(.at[1]) \\(.size[0]) \\(.size[1])\"'", "r");
+	if (hc) {
+		if (fscanf(hc, "%d %d %d %d", &gx, &gy, &aim.ww, &aim.wh) == 4)
+			printf("game window: %dx%d at (%d,%d)\n", aim.ww, aim.wh, gx, gy);
+		pclose(hc);
+	}
+	if (aim.ww == 0) { aim.ww = 1920; aim.wh = 1080; }
+
+	/* GTK3 layer-shell overlay */
+	gtk_init(NULL, NULL);
+
+	aim.win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	gtk_layer_init_for_window(GTK_WINDOW(aim.win));
+	gtk_layer_set_layer(GTK_WINDOW(aim.win), GTK_LAYER_SHELL_LAYER_OVERLAY);
+	gtk_layer_set_anchor(GTK_WINDOW(aim.win), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+	gtk_layer_set_anchor(GTK_WINDOW(aim.win), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
+	gtk_layer_set_anchor(GTK_WINDOW(aim.win), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
+	gtk_layer_set_anchor(GTK_WINDOW(aim.win), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
+	gtk_layer_set_keyboard_interactivity(GTK_WINDOW(aim.win), FALSE);
+	gtk_layer_set_exclusive_zone(GTK_WINDOW(aim.win), -1);
+
+	/* pin to the monitor where the game is */
+	GdkDisplay *gdk_dpy = gdk_display_get_default();
+	int n = gdk_display_get_n_monitors(gdk_dpy);
+	for (int i = 0; i < n; i++) {
+		GdkMonitor *m = gdk_display_get_monitor(gdk_dpy, i);
+		GdkRectangle geo;
+		gdk_monitor_get_geometry(m, &geo);
+		if (gx >= geo.x && gx < geo.x + geo.width &&
+		    gy >= geo.y && gy < geo.y + geo.height) {
+			gtk_layer_set_monitor(GTK_WINDOW(aim.win), m);
+			printf("overlay on monitor %d (%d,%d %dx%d)\n",
+			       i, geo.x, geo.y, geo.width, geo.height);
+			break;
+		}
+	}
+
+	/* transparent background */
+	GdkScreen *screen = gdk_screen_get_default();
+	GdkVisual *visual = gdk_screen_get_rgba_visual(screen);
+	if (visual) gtk_widget_set_visual(aim.win, visual);
+	gtk_widget_set_app_paintable(aim.win, TRUE);
+
+	aim.da = gtk_drawing_area_new();
+	gtk_container_add(GTK_CONTAINER(aim.win), aim.da);
+	g_signal_connect(aim.da, "draw", G_CALLBACK(aim_draw_cb), NULL);
+
+	gtk_widget_show_all(aim.win);
+
+	/* click-through: empty input region so all pointer events pass to game */
+	GdkWindow *gdk_win = gtk_widget_get_window(aim.win);
+	if (gdk_win) {
+		cairo_region_t *empty = cairo_region_create();
+		gdk_window_input_shape_combine_region(gdk_win, empty, 0, 0);
+		cairo_region_destroy(empty);
+	}
+
+	printf("aimpoint overlay (layer-shell) — Ctrl-C to stop (fov=%.0f)\n\n",
+	       c->fov > 0.0f ? c->fov : 90.0f);
+
+	g_timeout_add(2, aim_tick_cb, NULL);
+	gtk_main();
 	printf("\n");
 }
 
@@ -272,13 +506,15 @@ static void usage(const char *p){
 	    "  %s              bhop only (hold space)\n"
 	    "  %s --strafe     bhop + air control boost\n"
 	    "  %s --diag       diagnostic\n"
-	    "  %s --teleport X Z\n",p,p,p,p);
+	    "  %s --aim        dagger landing prediction\n"
+	    "  %s --teleport X Z\n",p,p,p,p,p);
 }
 
 int main(int argc, char **argv){
 	int mode=0, strafe=0; float tx=0,tz=0;
 	for(int i=1;i<argc;i++){
 		if(!strcmp(argv[i],"--diag")) mode=1;
+		else if(!strcmp(argv[i],"--aim")) mode=3;
 		else if(!strcmp(argv[i],"--strafe")) strafe=1;
 		else if(!strcmp(argv[i],"--teleport")&&i+2<argc){mode=2;tx=strtof(argv[++i],NULL);tz=strtof(argv[++i],NULL);}
 		else{usage(argv[0]);return 1;}
@@ -286,6 +522,8 @@ int main(int argc, char **argv){
 
 	struct cfg c;
 	memset(&c, 0, sizeof(c));
+
+	/* aim mode requires h_pitch + physics params in config */
 
 	/* try exe dir, then cwd, then ~/.config */
 	int loaded = 0;
@@ -305,6 +543,11 @@ int main(int argc, char **argv){
 	unsigned long base=get_base(); if(!base){fprintf(stderr,"no base\n");return 1;}
 	printf("pid=%d base=0x%lx\n",pid,base);
 	signal(SIGINT,sighandler); signal(SIGTERM,sighandler);
-	switch(mode){case 0:run_bhop(&c,base,strafe);break;case 1:run_diag(&c,base);break;case 2:run_teleport(&c,base,tx,tz);break;}
+	switch(mode){
+		case 0: run_bhop(&c,base,strafe); break;
+		case 1: run_diag(&c,base); break;
+		case 2: run_teleport(&c,base,tx,tz); break;
+		case 3: run_aim(&c,base); break;
+	}
 	return 0;
 }

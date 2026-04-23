@@ -12,7 +12,7 @@ gcc -O2 -o dd-bhop dd-bhop.c -lX11 -lm
 
 ## Setup
 
-Copy `example.conf` to `dd-bhop.conf` and fill in the offsets for your build. You need to find the pointer chain and hero struct layout yourself.
+Copy `example.conf` to `dd-bhop.conf` and fill in the offsets for your build. You need to find the pointer chain and hero struct layout yourself. Do not ask me for offsets, i am not giving them out. If you brick your game or get banned thats on you, this is a research project not a product. Use at your own risk.
 
 The tool looks for `dd-bhop.conf` in three places: next to the binary, current working directory, and `~/.config/dd-bhop.conf`.
 
